@@ -3,17 +3,14 @@
   "version": "3.6.0",
   "description": "AI 朝廷 - 多 Agent 协作框架",
   "main": "index.js",
-  "scripts": {
-    "test": "jest",
-    "test:coverage": "jest --coverage",
-    "test:watch": "jest --watch"
-  },
   "bin": {
     "task-store": "./scripts/task-store.js",
     "context-compressor": "./scripts/context-compressor.js"
   },
   "scripts": {
     "test": "node tests/test-task-store.js && node tests/test-context-compressor.js",
+    "test:coverage": "jest --coverage",
+    "test:watch": "jest --watch",
     "lint": "bash -n scripts/*.sh && node -c scripts/*.js 2>/dev/null || true",
     "health": "bash scripts/health-check.sh",
     "cleanup": "bash scripts/cleanup-repo.sh"

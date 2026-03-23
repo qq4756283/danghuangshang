@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { readFileSync, readdirSync, existsSync, statSync, createReadStream, openSync, readSync, closeSync, realpathSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, statSync, createReadStream, openSync, readSync, closeSync, realpathSync, appendFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -126,27 +126,181 @@ function sanitizeAgentId(id) {
   return id;
 }
 
+const GUI_DATA_DIR = join(__dirname, 'data');
+const SESSION_META_PATH = join(GUI_DATA_DIR, 'session-meta.json');
+const AUDIT_LOG_PATH = join(GUI_DATA_DIR, 'audit-log.json');
+
+function ensureGuiDataDir() {
+  try {
+    if (!existsSync(GUI_DATA_DIR)) {
+      require('fs').mkdirSync(GUI_DATA_DIR, { recursive: true });
+    }
+  } catch { }
+}
+
+function readJsonFileSafe(filePath, fallback) {
+  try {
+    if (!existsSync(filePath)) return fallback;
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFileSafe(filePath, data) {
+  ensureGuiDataDir();
+  require('fs').writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function readSessionMeta() {
+  return readJsonFileSafe(SESSION_META_PATH, {});
+}
+
+function writeSessionMeta(meta) {
+  writeJsonFileSafe(SESSION_META_PATH, meta);
+}
+
+function readAuditLog() {
+  return readJsonFileSafe(AUDIT_LOG_PATH, []);
+}
+
+function appendAuditLog(entry) {
+  const logs = readAuditLog();
+  logs.unshift(entry);
+  writeJsonFileSafe(AUDIT_LOG_PATH, logs.slice(0, 2000));
+  return entry;
+}
+
+function makeAuditEntry({ actor = 'admin', action, targetType, targetId, before, after }) {
+  return {
+    id: `audit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    actor,
+    action,
+    targetType,
+    targetId,
+    createdAt: Date.now(),
+    before,
+    after,
+  };
+}
+
+function getSessionMetaEntry(sessionId) {
+  const meta = readSessionMeta();
+  return meta[sessionId] || {};
+}
+
+function updateSessionMetaEntry(sessionId, patch) {
+  const meta = readSessionMeta();
+  meta[sessionId] = { ...(meta[sessionId] || {}), ...patch };
+  writeSessionMeta(meta);
+  clearCache();
+  return meta[sessionId];
+}
+
 function getAgentSessionData(agentId) {
   const sessionsPath = join(AGENTS_DIR, agentId, 'sessions', 'sessions.json');
-  if (!existsSync(sessionsPath)) return { sessions: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, model: '' };
+  if (!existsSync(sessionsPath)) return { sessions: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, model: '', lastActiveAt: null, activeSessions: 0 };
 
   try {
     const data = JSON.parse(readFileSync(sessionsPath, 'utf-8'));
     const entries = Object.values(data);
     let inputTokens = 0, outputTokens = 0, totalTokens = 0;
     let model = '';
+    let lastActiveAt = null;
+    let activeSessions = 0;
 
     for (const sess of entries) {
-      inputTokens += sess.inputTokens || 0;
-      outputTokens += sess.outputTokens || 0;
-      totalTokens += sess.totalTokens || 0;
+      const sessInputTokens = sess.inputTokens || sess.input_tokens || 0;
+      const sessOutputTokens = sess.outputTokens || sess.output_tokens || 0;
+      const sessTotalTokens = sess.totalTokens || sess.total_tokens || (sessInputTokens + sessOutputTokens);
+      inputTokens += sessInputTokens;
+      outputTokens += sessOutputTokens;
+      totalTokens += sessTotalTokens;
       if (sess.model && !model) model = sess.model;
+      if (!lastActiveAt || (sess.updatedAt || 0) > lastActiveAt) lastActiveAt = sess.updatedAt || 0;
+      if (sess.updatedAt && (Date.now() - sess.updatedAt < 3600000)) activeSessions++;
     }
 
-    return { sessions: entries.length, inputTokens, outputTokens, totalTokens, model };
+    return { sessions: entries.length, inputTokens, outputTokens, totalTokens, model, lastActiveAt, activeSessions };
   } catch (e) {
-    return { sessions: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, model: '' };
+    return { sessions: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, model: '', lastActiveAt: null, activeSessions: 0 };
   }
+}
+
+function normalizeSessionStatus(status, updatedAt) {
+  if (['active', 'idle', 'needs-human', 'error', 'archived'].includes(status)) return status;
+  const age = Date.now() - (updatedAt || 0);
+  if (age < 3600000) return 'active';
+  if (age < 86400000) return 'idle';
+  return 'archived';
+}
+
+function getConfiguredAgentIds(config = getOpenclawConfig() || {}) {
+  const ids = new Set();
+
+  if (existsSync(AGENTS_DIR)) {
+    for (const d of readdirSync(AGENTS_DIR, { withFileTypes: true })) {
+      if (d.isDirectory()) ids.add(d.name);
+    }
+  }
+
+  const agentsList = config?.agents?.list;
+  if (Array.isArray(agentsList)) {
+    for (const item of agentsList) {
+      if (item?.id) ids.add(item.id);
+    }
+  } else if (agentsList && typeof agentsList === 'object') {
+    for (const id of Object.keys(agentsList)) ids.add(id);
+  }
+
+  const channels = config?.channels || {};
+  for (const chConf of Object.values(channels)) {
+    const accounts = chConf?.accounts;
+    if (accounts && typeof accounts === 'object' && !Array.isArray(accounts)) {
+      for (const id of Object.keys(accounts)) ids.add(id);
+    }
+  }
+
+  return [...ids];
+}
+
+function parseSessionIdentifier(sessionId) {
+  if (!sessionId || typeof sessionId !== 'string') return null;
+  const parts = sessionId.split(':');
+  if (parts.length < 3) return null;
+  const rawAgentId = parts[1];
+  const agentId = sanitizeAgentId(rawAgentId);
+  if (!agentId) return null;
+  const sessionKey = parts.slice(2).join(':');
+  if (!sessionKey) return null;
+  return { agentId, sessionKey, sessionId: `agent:${agentId}:${sessionKey}` };
+}
+
+function loadRawSession(agentId, sessionKey) {
+  const sessionsPath = join(AGENTS_DIR, agentId, 'sessions', 'sessions.json');
+  if (!existsSync(sessionsPath)) return null;
+  try {
+    const sessionsData = JSON.parse(readFileSync(sessionsPath, 'utf-8'));
+    return sessionsData[sessionKey] || null;
+  } catch {
+    return null;
+  }
+}
+
+function getSessionMessageText(message) {
+  const msgContent = message?.content;
+  if (typeof msgContent === 'string') return msgContent;
+  if (Array.isArray(msgContent)) {
+    return msgContent.map(item => {
+      if (typeof item === 'string') return item;
+      if (item?.type === 'text') return item.text || '';
+      if (item?.type === 'toolCall') return `[tool:${item.name || 'unknown'}]`;
+      if (item?.type === 'toolResult') return `[tool-result:${item.toolName || 'unknown'}]`;
+      if (item?.type) return `[${item.type}]`;
+      return '';
+    }).join('').trim();
+  }
+  return '';
 }
 
 function getRecentLogs(limit = 100) {
@@ -580,29 +734,49 @@ async function buildSessionsData() {
           entries.forEach(([sessionKey, session], i) => {
             const updatedAt = session.updatedAt || 0;
             const counts = allCounts[i];
-            
+            const sessionId = sessionKey.startsWith(`agent:${agentId}:`) ? sessionKey : `agent:${agentId}:${sessionKey}`;
+            const meta = getSessionMetaEntry(sessionId);
+
             // 判定渠道
-            let channel = session.channel || session.lastChannel || 'unknown';
+            let channel = session.channel || session.lastChannel || session.deliveryContext?.channel || session.origin?.provider || 'unknown';
             if (channel === 'unknown') {
               if (sessionKey.includes('discord:')) channel = 'discord';
               else if (sessionKey.includes('cron:')) channel = 'cron';
               else if (sessionKey.includes('signal:')) channel = 'signal';
               else if (sessionKey.includes('telegram:')) channel = 'telegram';
+              else if (sessionKey.includes('agent:')) channel = 'agent';
+              else if (sessionKey.includes('webchat')) channel = 'webchat';
             }
-            
+
+            const baseInputTokens = session.inputTokens || session.input_tokens || 0;
+            const baseOutputTokens = session.outputTokens || session.output_tokens || 0;
+            const inputTokens = counts.inputTokens || baseInputTokens;
+            const outputTokens = counts.outputTokens || baseOutputTokens;
+            const totalTokens = session.totalTokens || session.total_tokens || (inputTokens + outputTokens);
+            const status = normalizeSessionStatus(meta.status, updatedAt);
+
             sessions.push({
-              id: `agent:${agentId}:${sessionKey}`,
+              id: sessionId,
               agentId,
               agentName: AGENT_DEPT_MAP[agentId] || agentId,
               channel,
               updatedAt,
               createdAt: session.createdAt || 0,
               messageCount: counts.messages,
-              inputTokens: counts.inputTokens,
-              outputTokens: counts.outputTokens,
-              totalTokens: counts.inputTokens + counts.outputTokens,
+              inputTokens,
+              outputTokens,
+              totalTokens,
               model: session.model || '',
               displayName: session.displayName || '',
+              status,
+              lastError: meta.lastError || null,
+              lastIntervenedAt: meta.lastIntervenedAt || null,
+              lastIntervenedBy: meta.lastIntervenedBy || null,
+              sessionFile: session.sessionFile || null,
+              sessionKey,
+              deliveryContext: session.deliveryContext || null,
+              origin: session.origin || null,
+              abortedLastRun: !!session.abortedLastRun,
             });
           });
         } catch (e) { }
@@ -623,11 +797,41 @@ async function buildSessionsData() {
 app.get('/api/sessions', authMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+    const status = req.query.status;
+    const agentId = req.query.agentId;
+    const hasError = req.query.hasError === 'true';
+    const intervened = req.query.intervened === 'true';
+    const q = (req.query.q || '').toLowerCase().trim();
+    const sortBy = req.query.sortBy || 'updatedAt';
+    const order = req.query.order === 'asc' ? 1 : -1;
     const data = await buildSessionsData();
+    let sessions = data.sessions;
+
+    if (status) sessions = sessions.filter(s => s.status === status);
+    if (agentId) sessions = sessions.filter(s => s.agentId === agentId || s.agentName === agentId);
+    if (hasError) sessions = sessions.filter(s => !!s.lastError);
+    if (intervened) sessions = sessions.filter(s => !!s.lastIntervenedAt);
+    if (q) sessions = sessions.filter(s => (
+      s.agentId.toLowerCase().includes(q) ||
+      s.agentName.toLowerCase().includes(q) ||
+      s.channel.toLowerCase().includes(q) ||
+      s.id.toLowerCase().includes(q)
+    ));
+
+    sessions = sessions.sort((a, b) => {
+      if (sortBy === 'tokens') return (a.totalTokens - b.totalTokens) * order;
+      if (sortBy === 'messages') return (a.messageCount - b.messageCount) * order;
+      return ((a.updatedAt || 0) - (b.updatedAt || 0)) * order;
+    });
+
+    const total = sessions.length;
     res.json({ 
-      sessions: data.sessions.slice(0, limit), 
-      total: data.total,
-      active: data.active
+      sessions: sessions.slice(offset, offset + limit), 
+      total,
+      offset,
+      limit,
+      active: sessions.filter(s => s.status === 'active').length
     });
   } catch (err) {
     res.status(500).json({ error: err.message, sessions: [], total: 0, active: 0 });
@@ -866,12 +1070,10 @@ app.get('/api/sessions/:sessionId/messages', authMiddleware, (req, res) => {
     const search = (req.query.search || '').toLowerCase().trim();
     const allMessages = [];
     
-    const parts = sessionId.split(':');
-    const rawAgentId = parts[1];
-    const agentId = rawAgentId ? sanitizeAgentId(rawAgentId) : 'silijian';
-    if (!agentId) return res.status(400).json({ error: 'Invalid agent ID', messages: [], total: 0, page: 1, totalPages: 0 });
-    const sessionKey = parts.slice(2).join(':');
-    
+    const parsedSession = parseSessionIdentifier(sessionId);
+    if (!parsedSession) return res.status(400).json({ error: 'Invalid session ID', messages: [], total: 0, page: 1, totalPages: 0 });
+    const { agentId, sessionKey } = parsedSession;
+
     const sessionsPath = join(AGENTS_DIR, agentId, 'sessions', 'sessions.json');
     if (existsSync(sessionsPath)) {
       const sessionsData = JSON.parse(readFileSync(sessionsPath, 'utf-8'));
@@ -938,15 +1140,44 @@ app.get('/api/sessions/:sessionId/messages', authMiddleware, (req, res) => {
 });
 
 // ========== SESSION SUMMARY ==========
+app.get('/api/sessions/:sessionId', authMiddleware, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const data = await buildSessionsData();
+    const session = data.sessions.find(s => s.id === sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const rawSessionInfo = parseSessionIdentifier(sessionId);
+    const rawSession = rawSessionInfo ? loadRawSession(rawSessionInfo.agentId, rawSessionInfo.sessionKey) : null;
+    const meta = getSessionMetaEntry(sessionId);
+    res.json({
+      session: {
+        ...session,
+        status: normalizeSessionStatus(meta.status || session.status, session.updatedAt),
+        lastError: meta.lastError || session.lastError || null,
+        lastIntervenedAt: meta.lastIntervenedAt || session.lastIntervenedAt || null,
+        lastIntervenedBy: meta.lastIntervenedBy || session.lastIntervenedBy || null,
+        stopReason: meta.stopReason || null,
+        sessionFile: rawSession?.sessionFile || session.sessionFile || null,
+        model: session.model || rawSession?.model || '',
+        lastChannel: rawSession?.lastChannel || session.channel,
+        deliveryContext: rawSession?.deliveryContext || session.deliveryContext || null,
+        origin: rawSession?.origin || session.origin || null,
+        abortedLastRun: rawSession?.abortedLastRun ?? session.abortedLastRun ?? false,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/sessions/:sessionId/summary', authMiddleware, (req, res) => {
   try {
     const { sessionId } = req.params;
-    const parts = sessionId.split(':');
-    const rawAgentId = parts[1];
-    const agentId = rawAgentId ? sanitizeAgentId(rawAgentId) : 'silijian';
-    if (!agentId) return res.status(400).json({ error: 'Invalid agent ID' });
-    const sessionKey = parts.slice(2).join(':');
-    
+    const parsedSession = parseSessionIdentifier(sessionId);
+    if (!parsedSession) return res.status(400).json({ error: 'Invalid session ID' });
+    const { agentId, sessionKey } = parsedSession;
+
     const sessionsPath = join(AGENTS_DIR, agentId, 'sessions', 'sessions.json');
     if (!existsSync(sessionsPath)) return res.json({ error: 'Session not found' });
     
@@ -2200,6 +2431,289 @@ function readSkillMeta(skillDir, name) {
 }
 
 // GET /api/skills — list all skills (local + builtin)
+app.get('/api/agents', authMiddleware, (req, res) => {
+  try {
+    const config = getOpenclawConfig() || {};
+    const defaultModel = config?.agents?.defaults?.model?.primary || config?.defaultModel || 'unknown';
+    const q = (req.query.q || '').toLowerCase().trim();
+    const statusFilter = req.query.status;
+    const sortBy = req.query.sortBy || 'lastActiveAt';
+    const order = req.query.order === 'asc' ? 1 : -1;
+    const agentIds = getConfiguredAgentIds(config);
+    const sessionMeta = readSessionMeta();
+
+    const agents = agentIds.map(id => {
+      const sessData = getAgentSessionData(id);
+      let agentConfig = {};
+      if (Array.isArray(config?.agents?.list)) {
+        agentConfig = config.agents.list.find(a => a.id === id) || {};
+      } else {
+        agentConfig = config?.agents?.list?.[id] || {};
+      }
+      const model = agentConfig?.model?.primary || sessData.model || defaultModel;
+      const agentMetaEntries = Object.entries(sessionMeta).filter(([sessionId]) => sessionId.startsWith(`agent:${id}:`));
+      const recentAgentError = agentMetaEntries
+        .map(([, meta]) => meta)
+        .filter(meta => meta?.lastError)
+        .sort((a, b) => (b.lastIntervenedAt || 0) - (a.lastIntervenedAt || 0))[0]?.lastError || null;
+
+      let status = 'offline';
+      if (recentAgentError) status = 'error';
+      else if ((sessData.activeSessions || 0) > 0) status = 'online';
+      else if ((sessData.sessions || 0) > 0) status = 'warning';
+      else if (agentConfig?.enabled === false) status = 'paused';
+
+      return {
+        id,
+        displayName: AGENT_DEPT_MAP[id] || agentConfig?.name || id,
+        model,
+        status,
+        sessionCount: sessData.sessions,
+        activeSessionCount: sessData.activeSessions || 0,
+        totalTokens: sessData.totalTokens,
+        lastActiveAt: sessData.lastActiveAt || null,
+        lastError: recentAgentError,
+      };
+    }).filter(agent => {
+      if (statusFilter && agent.status !== statusFilter) return false;
+      if (!q) return true;
+      return agent.id.toLowerCase().includes(q) || agent.displayName.toLowerCase().includes(q) || (agent.model || '').toLowerCase().includes(q);
+    }).sort((a, b) => {
+      if (sortBy === 'tokens') return (a.totalTokens - b.totalTokens) * order;
+      if (sortBy === 'sessionCount') return (a.sessionCount - b.sessionCount) * order;
+      return ((a.lastActiveAt || 0) - (b.lastActiveAt || 0)) * order;
+    });
+
+    res.json({ agents, total: agents.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message, agents: [] });
+  }
+});
+
+app.get('/api/agents/:id', authMiddleware, (req, res) => {
+  try {
+    const id = sanitizeAgentId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Invalid agent ID' });
+    const config = getOpenclawConfig() || {};
+    const defaultModel = config?.agents?.defaults?.model?.primary || config?.defaultModel || 'unknown';
+    const sessData = getAgentSessionData(id);
+    let agentConfig = {};
+    if (Array.isArray(config?.agents?.list)) {
+      agentConfig = config.agents.list.find(a => a.id === id) || {};
+    } else {
+      agentConfig = config?.agents?.list?.[id] || {};
+    }
+    const agentMetaEntries = Object.entries(readSessionMeta()).filter(([sessionId]) => sessionId.startsWith(`agent:${id}:`));
+    const recentAgentError = agentMetaEntries
+      .map(([, meta]) => meta)
+      .filter(meta => meta?.lastError)
+      .sort((a, b) => (b.lastIntervenedAt || 0) - (a.lastIntervenedAt || 0))[0]?.lastError || null;
+    const status = recentAgentError ? 'error' : ((sessData.activeSessions || 0) > 0 ? 'online' : ((sessData.sessions || 0) > 0 ? 'warning' : 'offline'));
+    const agent = {
+      id,
+      displayName: AGENT_DEPT_MAP[id] || agentConfig?.name || id,
+      model: agentConfig?.model?.primary || sessData.model || defaultModel,
+      status,
+      sessionCount: sessData.sessions,
+      activeSessionCount: sessData.activeSessions || 0,
+      totalTokens: sessData.totalTokens,
+      lastActiveAt: sessData.lastActiveAt || null,
+      lastError: recentAgentError,
+    };
+    res.json({ agent });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/agents/:id/summary', authMiddleware, async (req, res) => {
+  try {
+    const id = sanitizeAgentId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Invalid agent ID' });
+    const data = await buildSessionsData();
+    const recentSessions = data.sessions
+      .filter(s => s.agentId === id)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 10)
+      .map(s => ({
+        id: s.id,
+        updatedAt: s.updatedAt,
+        messageCount: s.messageCount,
+        totalTokens: s.totalTokens,
+        status: s.status,
+        lastError: s.lastError || null,
+      }));
+    const recentErrors = [...new Set(recentSessions.filter(s => s.lastError).map(s => s.lastError))];
+    const summary = {
+      recentSessions,
+      recentErrors,
+      health: {
+        score: recentSessions.length === 0 ? 70 : Math.max(40, 100 - recentSessions.filter(s => s.lastError).length * 15),
+        label: recentErrors.length > 0 ? 'warning' : (recentSessions.length > 0 ? 'healthy' : 'idle'),
+      }
+    };
+    res.json({ summary, agentId: id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/audit', authMiddleware, (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+    const targetType = req.query.targetType;
+    const targetId = req.query.targetId;
+    const action = req.query.action;
+    const actor = req.query.actor;
+    let items = readAuditLog();
+    if (targetType) items = items.filter(i => i.targetType === targetType);
+    if (targetId) items = items.filter(i => i.targetId === targetId);
+    if (action) items = items.filter(i => (i.action || '').includes(action));
+    if (actor) items = items.filter(i => (i.actor || '').includes(actor));
+    const total = items.length;
+    res.json({ items: items.slice(offset, offset + limit), total, offset, limit });
+  } catch (err) {
+    res.status(500).json({ error: err.message, items: [] });
+  }
+});
+
+app.post('/api/sessions/:sessionId/message', authMiddleware, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { message, actor = 'admin' } = req.body || {};
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ success: false, error: 'message is required' });
+    }
+
+    const parsedSession = parseSessionIdentifier(sessionId);
+    if (!parsedSession) return res.status(400).json({ success: false, error: 'invalid sessionId' });
+    const { agentId, sessionKey } = parsedSession;
+
+    const data = await buildSessionsData();
+    const found = data.sessions.find(s => s.id === sessionId);
+    if (!found) return res.status(404).json({ success: false, error: 'session not found' });
+
+    const sessionMetaBefore = getSessionMetaEntry(sessionId);
+    const args = ['agent', '--agent', agentId, '--session-id', sessionKey, '--message', message.trim(), '--json', '--timeout', '120'];
+    const { stdout } = await execFileAsync(CLI_CMD, args, { encoding: 'utf-8', timeout: 130000 });
+    let parsed = {};
+    try { parsed = JSON.parse(stdout); } catch { }
+
+    const afterMeta = updateSessionMetaEntry(sessionId, {
+      status: 'needs-human',
+      lastIntervenedAt: Date.now(),
+      lastIntervenedBy: actor,
+      lastError: null,
+      lastInterventionMessage: message.trim(),
+    });
+    const audit = appendAuditLog(makeAuditEntry({
+      actor,
+      action: 'session.message',
+      targetType: 'session',
+      targetId: sessionId,
+      before: sessionMetaBefore,
+      after: { ...afterMeta, message: message.trim() },
+    }));
+
+    clearCache();
+    res.json({
+      success: true,
+      queued: true,
+      auditId: audit.id,
+      reply: parsed.reply || parsed.result?.reply || stdout.trim().slice(0, 500),
+      session: { id: sessionId, status: afterMeta.status, lastIntervenedAt: afterMeta.lastIntervenedAt, lastIntervenedBy: afterMeta.lastIntervenedBy }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/sessions/:sessionId/stop', authMiddleware, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { reason, actor = 'admin' } = req.body || {};
+    if (!reason || typeof reason !== 'string' || !reason.trim()) {
+      return res.status(400).json({ success: false, error: 'reason is required' });
+    }
+
+    const parsedSession = parseSessionIdentifier(sessionId);
+    if (!parsedSession) return res.status(400).json({ success: false, error: 'invalid sessionId' });
+    const { agentId, sessionKey } = parsedSession;
+    const rawSession = loadRawSession(agentId, sessionKey);
+    const before = getSessionMetaEntry(sessionId);
+
+    let cliError = null;
+    if (rawSession?.sessionFile && existsSync(rawSession.sessionFile)) {
+      try {
+        appendFileSync(rawSession.sessionFile, `${JSON.stringify({
+          type: 'custom',
+          customType: 'admin-stop',
+          timestamp: new Date().toISOString(),
+          data: { actor, reason: reason.trim() }
+        })}\n`);
+      } catch (e) {
+        cliError = e.message;
+      }
+    }
+
+    const after = updateSessionMetaEntry(sessionId, {
+      status: 'archived',
+      lastError: `Stopped by ${actor}: ${reason.trim()}`,
+      stoppedAt: Date.now(),
+      stopReason: reason.trim(),
+      lastIntervenedAt: Date.now(),
+      lastIntervenedBy: actor,
+    });
+    const audit = appendAuditLog(makeAuditEntry({
+      actor,
+      action: 'session.stop',
+      targetType: 'session',
+      targetId: sessionId,
+      before,
+      after,
+    }));
+    clearCache();
+    res.json({ success: true, status: 'archived', auditId: audit.id, warning: cliError, session: { id: sessionId, status: after.status } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.patch('/api/sessions/:sessionId/status', authMiddleware, (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { status, actor = 'admin', note } = req.body || {};
+    if (!['active', 'idle', 'needs-human', 'error', 'archived'].includes(status)) {
+      return res.status(400).json({ success: false, error: 'invalid status' });
+    }
+    const before = getSessionMetaEntry(sessionId);
+    const nextMeta = {
+      status,
+      lastIntervenedAt: Date.now(),
+      lastIntervenedBy: actor,
+      ...(status === 'error'
+        ? { lastError: note || before.lastError || 'Manually marked as error' }
+        : status === 'archived'
+          ? { lastError: note || before.lastError || null }
+          : { lastError: note ? before.lastError || null : (status === 'active' ? null : before.lastError || null) }),
+    };
+    const after = updateSessionMetaEntry(sessionId, nextMeta);
+    const audit = appendAuditLog(makeAuditEntry({
+      actor,
+      action: 'session.status.update',
+      targetType: 'session',
+      targetId: sessionId,
+      before,
+      after,
+    }));
+    clearCache();
+    res.json({ success: true, session: { id: sessionId, status: after.status, lastError: after.lastError || null }, auditId: audit.id });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/skills', authMiddleware, (req, res) => {
   try {
     const { localSkillsDir, builtinDir } = getSkillsDirs();

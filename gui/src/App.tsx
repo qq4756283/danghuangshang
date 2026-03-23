@@ -25,13 +25,17 @@ const NotionBoard = lazy(() => import("./pages/NotionBoard"))
 const Search = lazy(() => import("./pages/Search"))
 const CronJobs = lazy(() => import("./pages/CronJobs"))
 const Skills = lazy(() => import("./pages/Skills"))
+const Agents = lazy(() => import("./pages/Agents"))
+const AuditLogs = lazy(() => import("./pages/AuditLogs"))
 
 const tabs: { key: TabName; label: string; icon: string }[] = [
   { key: "dashboard", label: "总览", icon: "📊" },
   { key: "court", label: "朝堂", icon: "🏯" },
   { key: "departments", label: "部门", icon: "🏛️" },
+  { key: "agents", label: "Agent", icon: "🤖" },
   { key: "tokens", label: "Token统计", icon: "🔥" },
   { key: "sessions", label: "会话", icon: "💬" },
+  { key: "audit", label: "审计", icon: "🧾" },
   { key: "channels", label: "频道", icon: "📡" },
   { key: "nodes", label: "节点", icon: "🖥️" },
   { key: "notion", label: "奏章板", icon: "📜" },
@@ -51,6 +55,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabName>("dashboard")
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sessionFilter, setSessionFilter] = useState<string | undefined>(undefined)
+  const [auditFilter, setAuditFilter] = useState<{ targetType?: string; targetId?: string; action?: string } | undefined>(undefined)
   const { theme, toggle: toggleTheme } = useTheme()
   const { data, loading, error, lastUpdated, refresh } = useStatus()
 
@@ -94,8 +99,13 @@ function App() {
       }} />
       case "court": return <Court />
       case "departments": return <Departments data={data} />
+      case "agents": return <Agents />
       case "tokens": return <TokenStats data={data} />
-      case "sessions": return <Sessions initialFilter={sessionFilter} />
+      case "sessions": return <Sessions initialFilter={sessionFilter} onOpenAudit={(targetId) => {
+        setAuditFilter({ targetType: 'session', targetId })
+        setActiveTab('audit')
+      }} />
+      case "audit": return <AuditLogs initialFilter={auditFilter} />
       case "channels": return <Channels />
       case "nodes": return <Nodes />
       case "notion": return <NotionBoard />
@@ -134,7 +144,7 @@ function App() {
           {tabs.map((tab) => (
             <button
               key={tab.key}
-              onClick={() => { setSessionFilter(undefined); setActiveTab(tab.key); setSidebarOpen(false) }}
+              onClick={() => { setSessionFilter(undefined); setAuditFilter(undefined); setActiveTab(tab.key); setSidebarOpen(false) }}
               className={`w-full flex items-center gap-3 px-5 py-2.5 text-sm transition-all cursor-pointer ${
                 activeTab === tab.key
                   ? 'nav-active'
